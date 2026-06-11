@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agnes 多模态流水线</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>Agnes 多模态流水线</h1>
+    <p class="subtitle">文本 → 图片 → 视频，逐条自动生成</p>
+  </header>
+
+  <section class="controls">
+    <label>
+      主题
+      <input id="themeInput" type="text" placeholder="留空则随机创意，如：科幻城市" />
+    </label>
+    <button id="saveThemeBtn" type="button">保存主题</button>
+    <button id="stopBtn" type="button" class="btn-danger">停止（跑完当前这条）</button>
+    <button id="startBtn" type="button" class="btn-primary">重新启动</button>
+    <button id="clearCompletedBtn" type="button" class="btn-ghost">清空已完成</button>
+    <div id="statusBar" class="status-bar">加载中...</div>
+  </section>
+
+  <main id="itemList" class="item-list"></main>
+
+  <section class="log-section">
+    <div class="log-header">
+      <h2>失败日志 <span id="logCount" class="log-count">0</span></h2>
+      <button id="clearLogsBtn" type="button" class="btn-ghost btn-sm">清空全部日志</button>
+    </div>
+    <div id="logList" class="log-list"></div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
