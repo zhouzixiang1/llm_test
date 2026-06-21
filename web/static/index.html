@@ -7,24 +7,144 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
+  <a href="#itemList" class="skip-link">跳到内容</a>
+
   <header class="header">
     <h1>Agnes 多模态流水线</h1>
     <p class="subtitle">文本 → 图片 → 视频，逐条自动生成</p>
   </header>
 
-  <section class="controls">
+  <nav class="controls" role="navigation" aria-label="流水线控制">
     <label>
       主题
       <input id="themeInput" type="text" placeholder="留空则随机创意，如：科幻城市" />
     </label>
+    <label>
+      视觉风格
+      <select id="stylePreset">
+        <option value="none">无</option>
+        <option value="cinematic">电影</option>
+        <option value="anime">动漫</option>
+        <option value="watercolor">水彩</option>
+        <option value="photorealistic">写实</option>
+        <option value="scifi">科幻</option>
+      </select>
+    </label>
+    <label>
+      风格变化
+      <select id="variationMode">
+        <option value="off">关闭</option>
+        <option value="style_prompt">换风格（提示词）</option>
+        <option value="style_prompt_img2img">换风格（提示词+参考图）</option>
+      </select>
+    </label>
+    <input id="searchInput" type="text" placeholder="搜索标题或提示词..." class="search-input" aria-label="搜索标题或提示词" />
+    <select id="statusFilter" class="status-filter" aria-label="按状态筛选">
+      <option value="">全部状态</option>
+      <option value="completed">已完成</option>
+      <option value="generating_video">生成视频中</option>
+      <option value="pending">等待中</option>
+    </select>
     <button id="saveThemeBtn" type="button">保存主题</button>
     <button id="stopBtn" type="button" class="btn-danger">停止（跑完当前这条）</button>
     <button id="startBtn" type="button" class="btn-primary">重新启动</button>
     <button id="clearCompletedBtn" type="button" class="btn-ghost">清空已完成</button>
-    <div id="statusBar" class="status-bar">加载中...</div>
-  </section>
+    <button id="viewToggleBtn" type="button" class="btn-ghost btn-sm" title="切换视图">⊞</button>
+    <button id="themeToggleBtn" type="button" class="btn-ghost btn-sm" title="切换主题">🌙</button>
 
-  <main id="itemList" class="item-list"></main>
+    <details class="advanced-settings">
+      <summary>高级设置</summary>
+      <div class="advanced-settings-grid">
+        <label>
+          图片尺寸
+          <input id="imageSizeInput" type="text" placeholder="1024x768" />
+        </label>
+        <label>
+          视频宽度
+          <input id="videoWidthInput" type="number" placeholder="1152" min="256" max="2048" />
+        </label>
+        <label>
+          视频高度
+          <input id="videoHeightInput" type="number" placeholder="768" min="256" max="2048" />
+        </label>
+        <label>
+          视频帧数
+          <input id="videoNumFramesInput" type="number" placeholder="81" min="9" max="409" step="8" />
+        </label>
+        <label>
+          视频帧率
+          <input id="videoFrameRateInput" type="number" placeholder="24" min="1" max="60" />
+        </label>
+        <label>
+          批量限制
+          <input id="batchLimitInput" type="number" placeholder="0（不限制）" min="0" />
+        </label>
+        <label>
+          计划开始时间
+          <input id="scheduleStartInput" type="time" />
+        </label>
+        <label>
+          计划结束时间
+          <input id="scheduleEndInput" type="time" />
+        </label>
+        <label>
+          保留天数
+          <input id="retentionDaysInput" type="number" placeholder="0（不限制）" min="0" />
+        </label>
+      </div>
+      <button id="saveAdvancedBtn" type="button" class="btn-primary btn-sm">保存高级设置</button>
+      <button id="cleanupBtn" type="button" class="btn-ghost btn-sm">清理过期内容</button>
+    </details>
+
+    <div id="statusBar" class="status-bar" role="status">
+      <span id="sseDot" class="sse-dot" title="SSE 未连接"></span>
+      <span id="statusText">加载中...</span>
+    </div>
+  </nav>
+  <div id="lastError" class="error-banner" style="display:none" role="alert"></div>
+
+  <!-- 生成统计 -->
+  <details class="analytics-section">
+    <summary>生成统计</summary>
+    <div id="analyticsPanel" class="analytics-grid" aria-live="polite">
+      <div class="analytics-loading">加载中...</div>
+    </div>
+  </details>
+
+  <!-- 提示词模板 -->
+  <details class="templates-section">
+    <summary>提示词模板</summary>
+    <div id="templateList" class="template-list"></div>
+    <div class="template-form-area">
+      <h3 id="templateFormTitle">新建模板</h3>
+      <input id="tplNameInput" type="text" placeholder="模板名称" />
+      <textarea id="tplImagePrompt" rows="3" placeholder="图片提示词模板（{theme} 替换为主题）"></textarea>
+      <textarea id="tplVideoPrompt" rows="3" placeholder="视频提示词模板（可选）"></textarea>
+      <input id="tplStyleModifiers" type="text" placeholder="风格修饰词（可选，如 cinematic, moody）" />
+      <div class="template-form-buttons">
+        <button id="tplSaveBtn" type="button" class="btn-primary btn-sm">保存模板</button>
+        <button id="tplCancelBtn" type="button" class="btn-ghost btn-sm" style="display:none">取消编辑</button>
+      </div>
+    </div>
+  </details>
+
+  <!-- Webhook 通知 -->
+  <details class="webhooks-section">
+    <summary>Webhook 通知</summary>
+    <div id="webhookList" class="webhook-list"></div>
+    <div class="webhook-form-area">
+      <h3 id="webhookFormTitle">新建 Webhook</h3>
+      <input id="whUrlInput" type="url" placeholder="Webhook URL (https://...)" />
+      <input id="whEventsInput" type="text" placeholder="事件类型 (逗号分隔，如 item_created,item_updated)" />
+      <input id="whSecretInput" type="text" placeholder="签名密钥 (可选)" />
+      <div class="webhook-form-buttons">
+        <button id="whSaveBtn" type="button" class="btn-primary btn-sm">保存</button>
+        <button id="whCancelBtn" type="button" class="btn-ghost btn-sm" style="display:none">取消</button>
+      </div>
+    </div>
+  </details>
+
+  <main id="itemList" class="item-list" role="main"></main>
 
   <section class="log-section">
     <div class="log-header">
@@ -33,6 +153,8 @@
     </div>
     <div id="logList" class="log-list"></div>
   </section>
+
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
 
   <script src="/static/app.js"></script>
 </body>
