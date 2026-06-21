@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,7 +20,112 @@ import urllib3.util.connection as urllib3_connection
 
 logger = logging.getLogger(__name__)
 
-API_BASE = "https://apihub.agnes-ai.com"
+
+# ── 结构化日志 ────────────────────────────────────────────────────────────────
+
+
+class JsonFormatter(logging.Formatter):
+    """自定义 JSON 日志格式化器，支持 item_id、step、duration_ms 上下文字段。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        log_record: dict[str, Any] = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "item_id"):
+            log_record["item_id"] = record.item_id
+        if hasattr(record, "step"):
+            log_record["step"] = record.step
+        if hasattr(record, "duration_ms"):
+            log_record["duration_ms"] = record.duration_ms
+        if record.exc_info:
+            log_record["exception"] = self.formatException(record.exc_info)
+        return _json.dumps(log_record, ensure_ascii=False)
+
+
+def log_with_context(
+    level: int,
+    msg: str,
+    *,
+    item_id: str | None = None,
+    step: str | None = None,
+    duration_ms: int | None = None,
+    **kwargs: Any,
+) -> None:
+    """带上下文信息的结构化日志。"""
+    extra: dict[str, Any] = {}
+    if item_id is not None:
+        extra["item_id"] = item_id
+    if step is not None:
+        extra["step"] = step
+    if duration_ms is not None:
+        extra["duration_ms"] = duration_ms
+    logger.log(level, msg, extra=extra, **kwargs)
+
+
+# ── 熔断器 ──────────────────────────────────────────────────────────────────
+
+class CircuitBreaker:
+    """连续失败达到阈值后停止请求，冷却后试探恢复。"""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(self, failure_threshold: int = 5, cooldown_seconds: float = 120.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._cooldown_seconds = cooldown_seconds
+        self._failure_count = 0
+        self._state = self.CLOSED
+        self._last_failure_time: float = 0
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def allow_request(self) -> bool:
+        with self._lock:
+            if self._state == self.CLOSED:
+                return True
+            if self._state == self.OPEN:
+                if time.monotonic() - self._last_failure_time >= self._cooldown_seconds:
+                    self._state = self.HALF_OPEN
+                    return True
+                return False
+            return True  # HALF_OPEN 允许一次试探
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._state = self.CLOSED
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.monotonic()
+            if self._failure_count >= self._failure_threshold:
+                if self._state != self.OPEN:
+                    logger.warning(
+                        "熔断器开启: 连续失败 %d 次，冷却 %ds",
+                        self._failure_count, self._cooldown_seconds,
+                    )
+                self._state = self.OPEN
+
+    def get_status(self) -> dict[str, Any]:
+        return {
+            "state": self._state,
+            "failure_count": self._failure_count,
+            "cooldown_seconds": self._cooldown_seconds,
+        }
+
+
+api_circuit_breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=120.0)
+
+API_BASE = os.environ.get("AGNES_API_BASE", "https://apihub.agnes-ai.com")
 DEFAULT_API_KEY = "sk-Qwbtdv3WHqxPpyHsnTJ3lV1pW1MmILPprBPGkDracOeALUy3"
 
 TEXT_MODEL = "agnes-2.0-flash"
@@ -53,6 +159,10 @@ def _api_request(
     max_total_time: float = 600,
     **kwargs: Any,
 ) -> requests.Response:
+    if not api_circuit_breaker.allow_request():
+        raise RuntimeError(
+            f"API 熔断器已开启，冷却中 (state={api_circuit_breaker.state})"
+        )
     last_error: Exception | None = None
     headers = kwargs.pop("headers", None) or {}
     start_time = time.monotonic()
@@ -60,6 +170,7 @@ def _api_request(
     with requests.Session() as session:
         for attempt in range(1, retries + 1):
             if time.monotonic() - start_time > max_total_time:
+                api_circuit_breaker.record_failure()
                 raise RuntimeError(f"API 请求总耗时超过 {max_total_time}s: {last_error}") from last_error
             try:
                 with _prefer_ipv4():
@@ -71,11 +182,18 @@ def _api_request(
                         **kwargs,
                     )
                 resp.raise_for_status()
+                api_circuit_breaker.record_success()
                 return resp
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
                 if 400 <= status < 500 and status not in (408, 429):
-                    raise
+                    try:
+                        detail = e.response.json() if e.response is not None else {}
+                    except Exception:
+                        detail = e.response.text[:500] if e.response is not None else ""
+                    raise RuntimeError(
+                        f"API 请求被拒绝 ({status}): {detail}"
+                    ) from e
                 last_error = e
             except RETRYABLE_EXCEPTIONS as e:
                 last_error = e
@@ -84,9 +202,11 @@ def _api_request(
             if attempt < retries:
                 remaining = max_total_time - (time.monotonic() - start_time)
                 if remaining <= 0:
+                    api_circuit_breaker.record_failure()
                     raise RuntimeError(f"API 请求总耗时超过 {max_total_time}s: {last_error}") from last_error
                 time.sleep(min(attempt * 3, 15, remaining))
 
+    api_circuit_breaker.record_failure()
     raise RuntimeError(f"API 请求失败: {last_error}") from last_error
 
 
@@ -174,6 +294,24 @@ def generate_image(
     raise RuntimeError(f"响应中未找到图片数据: {result}")
 
 
+def _get_max_frames(width: int, height: int) -> int:
+    """根据分辨率档位返回最大帧数限制。"""
+    max_dim = max(width, height)
+    if max_dim > 1440:
+        return 169
+    if max_dim > 854:
+        return 409
+    return 961
+
+
+def _clamp_frames(num_frames: int, max_frames: int) -> int:
+    """将帧数钳制到 ≤ max_frames 的最大合法值 (8n+1)。"""
+    if num_frames <= max_frames:
+        return num_frames
+    n = (max_frames - 1) // 8
+    return 8 * n + 1
+
+
 def create_video_task(
     prompt: str,
     *,
@@ -183,6 +321,18 @@ def create_video_task(
     num_frames: int = 81,
     frame_rate: int = 24,
 ) -> dict[str, Any]:
+    max_frames = _get_max_frames(width, height)
+    if num_frames < 9 or num_frames > max_frames:
+        num_frames = _clamp_frames(max_frames, max_frames)
+        logger.info("num_frames 已自动调整为 %d（分辨率 %dx%d 最大 %d 帧）", num_frames, width, height, max_frames)
+    if (num_frames - 1) % 8 != 0:
+        n = (num_frames - 1) // 8
+        num_frames = 8 * n + 1
+    if width < 256 or width > 2048 or width % 64 != 0:
+        raise ValueError(f"width 必须是 64 的倍数且在 256-2048 之间，当前值: {width}")
+    if height < 256 or height > 2048 or height % 64 != 0:
+        raise ValueError(f"height 必须是 64 的倍数且在 256-2048 之间，当前值: {height}")
+
     payload: dict[str, Any] = {
         "model": VIDEO_MODEL,
         "prompt": prompt,
@@ -199,8 +349,8 @@ def create_video_task(
         f"{API_BASE}/v1/videos",
         headers=_auth_headers(),
         json=payload,
-        timeout=(30, 60),
-        retries=5,
+        timeout=(30, 120),
+        retries=3,
     )
     return resp.json()
 
